@@ -125,3 +125,109 @@ When a client connects:
 * NGINX just forwards encrypted bytes to the backend server.
 * Since NGINX never decrypts, it cannot see HTTP headers, paths, or methods. It can only balance at layer 4 (IP + Port).
 * NGINX cannot do content-based routing here.
+
+### Using NGINX as Load Balancer.
+> I am not going to install NGINX locally, rather I will be using **Docker** to spin up a nginx container.
+
+We are going to create a simple server using node, express which will have only one end point ('/') and it returns hostname. We will spin up three containers for our node js server and a nginx container to load balance among the 3 servers. Please refer below code for that:
+```
+const express = require("express");
+const os = require("os");
+const app = express();
+
+const hostName = os.hostname();
+
+app.get("/", (req, res) => {
+    res.send("Hello from: " + hostName);
+})
+
+app.listen(3000, () => {
+    console.log("Server is listening on port 3000");
+});
+```
+
+Now create a Dockerfile as below:
+```
+FROM node:20
+WORKDIR /home/node/app
+COPY app/ .
+RUN npm install
+CMD node server.js
+```
+
+Refer below for the project structure:
+![Project Structure](project-structure.png)
+
+
+Now, we have our docker file ready, use below commands to create an image and then spin up three containers:
+```
+// creating the docker image named nodeapp
+docker build . -t nodeapp
+
+// spin up 3 containers (container names: nodeapp1, nodeapp2, nodeapp3) (hostnames: same as container names)
+docker run --name nodeapp1 --hostname nodeapp1 -d nodeapp
+docker run --name nodeapp2 --hostname nodeapp2 -d nodeapp
+docker run --name nodeapp3 --hostname nodeapp3 -d nodeapp
+```
+
+Now we need to create nginx.conf (configuration) file and write the rule to load balance the traffic among above 3 containers. So create a nginx.conf (we are kind of overwriting default nginx.conf file using docker volumes):
+```
+http {
+    upstream nodebackend {
+        server nodeapp1:3000;
+        server nodeapp2:3000;
+        server nodeapp3:3000;
+    }
+    server {
+        listen 8080;
+        location / {
+            proxy_pass http://nodebackend/;
+        }
+    }
+}
+
+events {}
+```
+
+Now to run the nginx container:
+```
+docker run --name nginx --hostname ng1 -p 80:8080 -v ${PWD}\nginx.conf:/etc/nginx/nginx.conf -d nginx
+
+```
+
+**But here we have an issue**
+> We are using hostnames (nodeapp1, nodeapp2, nodeapp3) in nginx.conf file, but nginx container will not be able to understand these hostnames (Resolve hostname to ip). If we use IP address instead of hostnames, it will work fine. But using hostname is simple and meaningful, so how to handle this issue. Just for a recap of what we have done (or trying to do so far):
+![Nginx LB Recap](nginx-lb-recap.png)
+Note: Our node apps are running on port 3000 (but in image it is shown as 8080, please ignore, it should be 3000).
+
+We will come at this issue later, let's understand a bit of Docker networking.
+
+#### Docker Networking
+Suppose I spin up two containers from the same image (hostnames are: s1 and s2 and IP address are 10.0.0.2 and 10.0.0.3 let's say). Now I exec into container s1 and do **ping s2, it will not work**. But if I do **ping 10.0.0.3, it will work**. 
+
+When we spin up containers, they are all part of default bridge network of docker and for bridge network the DNS resolver is same as the DNS resolver of our host. If from s1, you do ping google.com, it will work because the request goes to the DNS resolver of out host (which is usually our ISP). But if you do ping s2, then request goes to host DNS resolver, but s2 is completely inside docker network and is unknown to the outside world.
+![Docker network](docker-network.png)
+
+So, to be able to use hostnames, we can create our own docker network and attach containers to that network. In user-created network, the DNS resolver is the network it self and it can convert hostnames to IP addresses. Use below commands:
+```
+// to see all docker networks
+docker network ls
+
+// to create a network (network name: backendnet)
+docker network create backendnet
+
+// to add containers to the network
+docker network connect backendnet nodeapp1
+docker network connect backendnet nodeapp2
+docker network connect backendnet nodeapp3
+
+// to get more info about a network
+docker network inspect network_name
+```
+
+Now we have added all our node app containers to the backendnet network. Now just start the nginx container (we started previously, but it must have exited because hostnames were not reachable).
+```
+docker start nginx
+```
+
+Now, open the browser and hit: localhost:80 multiple times, you will see the hostname keeps on changing like: nodeapp1, nodeapp2, nodeapp3, nodeapp1, nodeapp2...
